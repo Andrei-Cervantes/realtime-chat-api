@@ -13,6 +13,28 @@ const io = new Server(httpServer, {
   },
 });
 
+const roomUsers = new Map();
+
+function addUserToRoom(roomId, username) {
+  if (!roomUsers.has(roomId)) {
+    roomUsers.set(roomId, new Set());
+  }
+  roomUsers.get(roomId).add(username);
+}
+
+function removeUserFromRoom(roomId, username) {
+  if (roomUsers.has(roomId)) {
+    roomUsers.get(roomId).delete(username);
+    if (roomUsers.get(roomId).size === 0) {
+      roomUsers.delete(roomId);
+    }
+  }
+}
+
+function getRoomUsers(roomId) {
+  return roomUsers.has(roomId) ? Array.from(roomUsers.get(roomId)) : [];
+}
+
 // Rooms endpoint
 app.get("/rooms", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "http://localhost:5173");
@@ -28,11 +50,36 @@ app.get("/rooms", async (req, res) => {
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
+  let currentUsername = null;
+  let currentRoomId = null;
 
   // join room
-  socket.on("join-room", async (roomId) => {
+  socket.on("join-room", async (data) => {
+    const { roomId, username } =
+      typeof data === "object" ? data : { roomId: data, username: null };
+
+    if (currentRoomId) {
+      socket.leave(`room-${currentRoomId}`);
+      if (currentUsername) {
+        removeUserFromRoom(currentRoomId, currentUsername);
+        io.to(`room-${currentRoomId}`).emit(
+          "room-users",
+          getRoomUsers(currentRoomId),
+        );
+      }
+    }
+
+    currentUsername = username || currentUsername;
+    currentRoomId = roomId;
+
     // Add this socket to the specified room
     socket.join(`room-${roomId}`);
+
+    if (currentUsername) {
+      addUserToRoom(roomId, currentUsername);
+      io.to(`room-${roomId}`).emit("room-users", getRoomUsers(roomId));
+    }
+
     try {
       // Fetch the last 50 messages for this room
       const result = await pool.query(
@@ -50,11 +97,18 @@ io.on("connection", (socket) => {
   // leave room
   socket.on("leave-room", (roomId) => {
     socket.leave(`room-${roomId}`);
+    if (currentUsername) {
+      removeUserFromRoom(roomId, currentUsername);
+      io.to(`room-${roomId}`).emit("room-users", getRoomUsers(roomId));
+    }
+    currentRoomId = null;
   });
 
   // send message
   socket.on("send-message", async (data) => {
     const { roomId, username, content } = data;
+    currentUsername = username;
+
     try {
       const result = await pool.query(
         "INSERT INTO messages (room_id, username, content) VALUES ($1, $2, $3) RETURNING *",
@@ -69,6 +123,13 @@ io.on("connection", (socket) => {
 
   // disconnect
   socket.on("disconnect", () => {
+    if (currentRoomId && currentUsername) {
+      removeUserFromRoom(currentRoomId, currentUsername);
+      io.to(`room-${currentRoomId}`).emit(
+        "room-users",
+        getRoomUsers(currentRoomId),
+      );
+    }
     console.log("User disconnected:", socket.id);
   });
 });
